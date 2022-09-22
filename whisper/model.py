@@ -1,15 +1,28 @@
 from dataclasses import dataclass
 from typing import Dict
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from transformers.utils import ModelOutput
+from torch.nn import CrossEntropyLoss
 from torch import Tensor
 from torch import nn
 
 from .transcribe import transcribe as transcribe_function
 from .decoding import detect_language as detect_language_function, decode as decode_function
+from transformers import T5Config
+from transformers.generation_utils import GenerationMixin
+
+
+class WhisperOutput(ModelOutput):
+    """
+    Base class for Whisper outputs.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
 
 
 @dataclass
@@ -140,11 +153,12 @@ class AudioEncoder(nn.Module):
         )
         self.ln_post = LayerNorm(n_state)
 
-    def forward(self, x: Tensor):
+    def forward(self, input_ids: Tensor, **kwargs):
         """
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
+        x = input_ids
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
@@ -194,9 +208,27 @@ class TextDecoder(nn.Module):
         return logits
 
 
-class Whisper(nn.Module):
+def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id: int = 50256, pad_token_id: int = 50256):
+    """
+    Shift input ids one token to the right.
+    """
+    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
+    shifted_input_ids[:, 0] = decoder_start_token_id
+
+    if pad_token_id is None:
+        raise ValueError("self.model.config.pad_token_id has to be defined.")
+    # replace possible -100 values in labels by `pad_token_id`
+    shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
+
+    return shifted_input_ids
+
+
+class Whisper(nn.Module, GenerationMixin):
     def __init__(self, dims: ModelDimensions):
         super().__init__()
+        self.config = T5Config()
+        self.config.decoder_start_token_id = 50256
         self.dims = dims
         self.encoder = AudioEncoder(
             self.dims.n_mels,
@@ -212,6 +244,16 @@ class Whisper(nn.Module):
             self.dims.n_text_head,
             self.dims.n_text_layer,
         )
+        self.encoder.main_input_name = "input_ids"
+        self.main_input_name = "input_ids"
+
+    def get_encoder(self):
+        return self.encoder
+
+    def freeze_encoder(self):
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self._requires_grad = False
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder.forward(mel)
@@ -219,8 +261,34 @@ class Whisper(nn.Module):
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
         return self.decoder.forward(tokens, audio_features)
 
-    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return self.decoder(tokens, self.encoder(mel))
+#    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+#        decoder_logits = self.decoder(tokens, self.encoder(mel))
+#        return decoder_logits
+
+    def prepare_inputs_for_generation(self, input_ids: torch.LongTensor, encoder_outputs, **kwargs) -> Dict[str, Any]:
+        """
+        Implement in subclasses of [`PreTrainedModel`] for custom behavior to prepare inputs in the generate method.
+        """
+        return {"input_ids": input_ids, "encoder_outputs": encoder_outputs}
+
+    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> Dict[str, torch.Tensor]:
+        if "encoder_outputs" in kwargs:
+            encoder_hidden_states = kwargs["encoder_outputs"]
+            tokens = input_ids
+            decoder_logits = self.decoder(tokens, encoder_hidden_states)
+            loss = None
+        else:
+            mel = input_ids
+            tokens = shift_tokens_right(labels)
+            encoder_hidden_states = self.encoder(mel)
+            decoder_logits = self.decoder(tokens, encoder_hidden_states)
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(decoder_logits.view(-1, decoder_logits.shape[-1]), labels.view(-1))
+
+        return WhisperOutput(loss=loss, logits=decoder_logits)
+
+    def save_to(self, save_path=None):
+        torch.save(self.state_dict(), save_path)
 
     @property
     def device(self):
