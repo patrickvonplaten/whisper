@@ -231,6 +231,7 @@ class Whisper(nn.Module, GenerationMixin):
         self.config.decoder_start_token_id = 50256
         self.config.eos_token_id = 50256
         self.config.bos_token_id = 50256
+        self.config.pad_token_id = 50256
         self.dims = dims
         self.encoder = AudioEncoder(
             self.dims.n_mels,
