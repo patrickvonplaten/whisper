@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict
 from typing import Iterable, Optional, Any
+import torch.utils.checkpoint
 
 import numpy as np
 import torch
@@ -187,6 +188,7 @@ class TextDecoder(nn.Module):
 
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
+        self.gradient_checkpointing = False
 
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
@@ -200,7 +202,10 @@ class TextDecoder(nn.Module):
         x = x.to(xa.dtype)
 
         for block in self.blocks:
-            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, xa, self.mask)
+            else:
+                x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
         x = self.ln(x)
         logits = (x @ self.token_embedding.weight.to(x.dtype).T).float()
@@ -249,6 +254,9 @@ class Whisper(nn.Module, GenerationMixin):
         )
         self.encoder.main_input_name = "input_ids"
         self.main_input_name = "input_ids"
+
+    def gradient_checkpointing_enable(self):
+        self.decoder.gradient_checkpointing = True
 
     def get_encoder(self):
         return self.encoder
