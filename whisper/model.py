@@ -115,8 +115,9 @@ class MultiHeadAttention(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False, dropout: float = 0.0):
         super().__init__()
+        self.dropout = dropout
 
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
@@ -135,22 +136,33 @@ class ResidualAttentionBlock(nn.Module):
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
     ):
-        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
+        residual = x
+        x = self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+        x = x + residual
         if self.cross_attn:
-            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)
+            residual = x
+            x = self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)
+            x = nn.functional.dropout(x, p=self.dropout, training=self.training)
+            x = x + residual
+        # the MLP needs to be changed from: fc1 -> act_fn -> fc2 to: fc1 -> act_fn -> dropout -> fc2 -> dropout
+        # since it's written as an nn.Sequential, adding the dropout would change the state_dict
+        # instead, we add dropout by overriding our pre-trained model in our training script (much faster!)
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, dropout: float):
         super().__init__()
+        self.dropout = 0.0
+
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
+            [ResidualAttentionBlock(n_state, n_head, dropout=self.dropout) for _ in range(n_layer)]
         )
         self.ln_post = LayerNorm(n_state)
 
@@ -166,6 +178,7 @@ class AudioEncoder(nn.Module):
 
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding).to(x.dtype)
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
 
         for block in self.blocks:
             x = block(x)
@@ -175,14 +188,15 @@ class AudioEncoder(nn.Module):
 
 
 class TextDecoder(nn.Module):
-    def __init__(self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    def __init__(self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, dropout: float):
         super().__init__()
+        self.dropout = dropout
 
         self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head, cross_attention=True) for _ in range(n_layer)]
+            [ResidualAttentionBlock(n_state, n_head, cross_attention=True, dropout=self.dropout) for _ in range(n_layer)]
         )
         self.ln = LayerNorm(n_state)
 
@@ -200,6 +214,7 @@ class TextDecoder(nn.Module):
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
         x = x.to(xa.dtype)
+        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
@@ -230,7 +245,7 @@ def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id: int = 50
 
 
 class Whisper(nn.Module, GenerationMixin):
-    def __init__(self, dims: ModelDimensions):
+    def __init__(self, dims: ModelDimensions, dropout_rate: Optional[float] = 0.0):
         super().__init__()
         self.config = T5Config()
         self.config.decoder_start_token_id = 50256
@@ -244,6 +259,7 @@ class Whisper(nn.Module, GenerationMixin):
             self.dims.n_audio_state,
             self.dims.n_audio_head,
             self.dims.n_audio_layer,
+            dropout_rate,
         )
         self.decoder = TextDecoder(
             self.dims.n_vocab,
@@ -251,6 +267,7 @@ class Whisper(nn.Module, GenerationMixin):
             self.dims.n_text_state,
             self.dims.n_text_head,
             self.dims.n_text_layer,
+            dropout_rate,
         )
         self.encoder.main_input_name = "input_ids"
         self.main_input_name = "input_ids"
