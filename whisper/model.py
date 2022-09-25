@@ -155,7 +155,7 @@ class ResidualAttentionBlock(nn.Module):
 class AudioEncoder(nn.Module):
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, dropout: float):
         super().__init__()
-        self.dropout = dropout
+        self.dropout = 0.0
 
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
