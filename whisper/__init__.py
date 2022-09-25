@@ -97,6 +97,7 @@ def load_model(name: str, device: Optional[Union[str, torch.device]] = None, dow
 
     dims = ModelDimensions(**checkpoint["dims"])
     state_dict = checkpoint["model_state_dict"]
+
     model = Whisper(dims, dropout_rate=dropout_rate)
     model.load_state_dict(state_dict)
 

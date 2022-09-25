@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict
 from typing import Iterable, Optional, Any
 import torch.utils.checkpoint
+from torch import load
 
 import numpy as np
 import torch
@@ -285,6 +286,30 @@ class Whisper(nn.Module, GenerationMixin):
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder.forward(mel)
+
+    @classmethod
+    def load_trained(cls, path):
+        state_dict = torch.load(path)
+
+        # for now hard-code the model dimensions of
+        # `medium.en`
+        model_dims = ModelDimensions(
+            n_mels=80,
+            n_audio_ctx=1500,
+            n_audio_state=1024,
+            n_audio_head=16,
+            n_audio_layer=24,
+            n_text_layer=24,
+            n_vocab=51864,
+            n_text_ctx=448,
+            n_text_state=1024,
+            n_text_head=16,
+        )
+        model = cls(model_dims)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        return model
 
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
         return self.decoder.forward(tokens, audio_features)
