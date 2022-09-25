@@ -18,6 +18,13 @@ from transformers import T5Config
 from transformers.generation_utils import GenerationMixin
 
 
+class EncoderOutput(ModelOutput):
+    """
+    Base class for Whisper outputs.
+    """
+
+    last_hidden_state: torch.FloatTensor = None
+
 class WhisperOutput(ModelOutput):
     """
     Base class for Whisper outputs.
@@ -185,7 +192,9 @@ class AudioEncoder(nn.Module):
             x = block(x)
 
         x = self.ln_post(x)
-        return x
+
+        encoder_output = EncoderOutput(last_hidden_state=x)
+        return encoder_output
 
 
 class TextDecoder(nn.Module):
@@ -326,14 +335,14 @@ class Whisper(nn.Module, GenerationMixin):
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> Dict[str, torch.Tensor]:
         if "encoder_outputs" in kwargs:
-            encoder_hidden_states = kwargs["encoder_outputs"]
+            encoder_hidden_states = kwargs["encoder_outputs"].last_hidden_state
             tokens = input_ids
             decoder_logits = self.decoder(tokens, encoder_hidden_states)
             loss = None
         else:
             mel = input_ids
             tokens = shift_tokens_right(labels)
-            encoder_hidden_states = self.encoder(mel)
+            encoder_hidden_states = self.encoder(mel).last_hidden_state
             decoder_logits = self.decoder(tokens, encoder_hidden_states)
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(decoder_logits.view(-1, decoder_logits.shape[-1]), labels.view(-1))
