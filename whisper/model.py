@@ -279,6 +279,7 @@ class Whisper(nn.Module, GenerationMixin):
             self.dims.n_text_layer,
             dropout_rate,
         )
+        self.kv_cache = None
         self.encoder.main_input_name = "input_ids"
         self.main_input_name = "input_ids"
 
@@ -335,11 +336,21 @@ class Whisper(nn.Module, GenerationMixin):
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> Dict[str, torch.Tensor]:
         if "encoder_outputs" in kwargs:
+            if self.kv_cache is None:
+                self.kv_cache, self.hooks = self.install_kv_cache_hooks()
+
             encoder_hidden_states = kwargs["encoder_outputs"].last_hidden_state
             tokens = input_ids
-            decoder_logits = self.decoder(tokens, encoder_hidden_states)
+
+            if tokens.shape[-1] > 1:
+                tokens = tokens[:, -1:]
+
+            decoder_logits = self.decoder(tokens, encoder_hidden_states, kv_cache=self.kv_cache)
             loss = None
         else:
+            if self.kv_cache is not None and self.hooks is not None:
+                self.clean_cache()
+
             mel = input_ids
             tokens = shift_tokens_right(labels)
             encoder_hidden_states = self.encoder(mel).last_hidden_state
@@ -348,6 +359,13 @@ class Whisper(nn.Module, GenerationMixin):
             loss = loss_fct(decoder_logits.view(-1, decoder_logits.shape[-1]), labels.view(-1))
 
         return WhisperOutput(loss=loss, logits=decoder_logits)
+
+    def clean_cache(self):
+        for hook in self.hooks:
+            hook.remove()
+
+        self.hooks = []
+        self.kv_cache = {}
 
     def save_to(self, save_path=None):
         torch.save(self.state_dict(), save_path)
