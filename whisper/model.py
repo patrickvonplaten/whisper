@@ -238,7 +238,7 @@ class TextDecoder(nn.Module):
         return logits
 
 
-def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id: int = 50256, pad_token_id: int = 50256):
+def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id, pad_token_id):
     """
     Shift input ids one token to the right.
     """
@@ -259,10 +259,12 @@ class Whisper(nn.Module, GenerationMixin):
         super().__init__()
         self.config = T5Config()
         self.config.decoder_start_token_id = 50257
+        self.config.bos_token_id = 50257
+
         self.config.eos_token_id = 50256
-        self.config.no_timestamp_token = 50362
-        self.config.bos_token_id = 50256
         self.config.pad_token_id = 50256
+
+        self.config.no_timestamp_token = 50362
         self.dims = dims
         self.encoder = AudioEncoder(
             self.dims.n_mels,
@@ -356,7 +358,7 @@ class Whisper(nn.Module, GenerationMixin):
                 self.clean_cache()
 
             mel = input_ids
-            tokens = shift_tokens_right(labels)
+            tokens = shift_tokens_right(labels, decoder_start_token_id=self.config.decoder_start_token_id, pad_token_id=self.config.pad_token_id)
             encoder_hidden_states = self.encoder(mel).last_hidden_state
             decoder_logits = self.decoder(tokens, encoder_hidden_states)
             loss_fct = CrossEntropyLoss()
