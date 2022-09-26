@@ -258,8 +258,9 @@ class Whisper(nn.Module, GenerationMixin):
     def __init__(self, dims: ModelDimensions, dropout_rate: Optional[float] = 0.0):
         super().__init__()
         self.config = T5Config()
-        self.config.decoder_start_token_id = 50256
+        self.config.decoder_start_token_id = 50257
         self.config.eos_token_id = 50256
+        self.config.no_timestamp_token = 50362
         self.config.bos_token_id = 50256
         self.config.pad_token_id = 50256
         self.dims = dims
@@ -332,18 +333,21 @@ class Whisper(nn.Module, GenerationMixin):
         """
         Implement in subclasses of [`PreTrainedModel`] for custom behavior to prepare inputs in the generate method.
         """
+        if input_ids.shape[-1] == 1 and self.kv_cache is not None and self.hooks is not None:
+            self.clean_cache()
+
+        if input_ids.shape[-1] > 1:
+            input_ids = input_ids[:, -1:]
+
         return {"input_ids": input_ids, "encoder_outputs": encoder_outputs}
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> Dict[str, torch.Tensor]:
         if "encoder_outputs" in kwargs:
-            if self.kv_cache is None:
+            if self.kv_cache is None or len(self.kv_cache) == 0:
                 self.kv_cache, self.hooks = self.install_kv_cache_hooks()
 
             encoder_hidden_states = kwargs["encoder_outputs"].last_hidden_state
             tokens = input_ids
-
-            if tokens.shape[-1] > 1:
-                tokens = tokens[:, -1:]
 
             decoder_logits = self.decoder(tokens, encoder_hidden_states, kv_cache=self.kv_cache)
             loss = None
