@@ -27,12 +27,20 @@ It also requires the command-line tool [`ffmpeg`](https://ffmpeg.org/) to be ins
 # on Ubuntu or Debian
 sudo apt update && sudo apt install ffmpeg
 
+# on Arch Linux
+sudo pacman -S ffmpeg
+
 # on MacOS using Homebrew (https://brew.sh/)
-brew install ffmpeg                         
+brew install ffmpeg
 
 # on Windows using Chocolatey (https://chocolatey.org/)
 choco install ffmpeg
+
+# on Windows using Scoop (https://scoop.sh/)
+scoop install ffmpeg
 ```
+
+You may need [`rust`](http://rust-lang.org) installed as well, in case [tokenizers](https://pypi.org/project/tokenizers/) does not provide a pre-built wheel for your platform. If you see installation errors during the `pip install` command above, please follow the [Getting started page](https://www.rust-lang.org/learn/get-started) to install Rust development environment.
 
 
 ## Available models and languages
@@ -119,4 +127,4 @@ print(result.text)
 
 ## License
 
-The code and the model weights of Whisper are released under the MIT License. See `LICENSE` for further details.
+The code and the model weights of Whisper are released under the MIT License. See [LICENSE](LICENSE) for further details.
