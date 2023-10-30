@@ -1,37 +1,16 @@
+import base64
+import gzip
 from dataclasses import dataclass
-from typing import Dict
-from typing import Iterable, Optional, Any
-import torch.utils.checkpoint
-from torch import load
+from typing import Dict, Iterable, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers.utils import ModelOutput
-from torch.nn import CrossEntropyLoss
-from torch import Tensor
-from torch import nn
+from torch import Tensor, nn
 
+from .decoding import decode as decode_function
+from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
-from .decoding import detect_language as detect_language_function, decode as decode_function
-from transformers import T5Config
-from transformers.generation_utils import GenerationMixin
-
-
-class EncoderOutput(ModelOutput):
-    """
-    Base class for Whisper outputs.
-    """
-
-    last_hidden_state: torch.FloatTensor = None
-
-class WhisperOutput(ModelOutput):
-    """
-    Base class for Whisper outputs.
-    """
-
-    loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
 
 
 @dataclass
@@ -56,12 +35,16 @@ class LayerNorm(nn.LayerNorm):
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(
-            x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype)
+            x,
+            self.weight.to(x.dtype),
+            None if self.bias is None else self.bias.to(x.dtype),
         )
 
 
 class Conv1d(nn.Conv1d):
-    def _conv_forward(self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+    def _conv_forward(
+        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
+    ) -> Tensor:
         return super()._conv_forward(
             x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
         )
@@ -94,20 +77,22 @@ class MultiHeadAttention(nn.Module):
     ):
         q = self.query(x)
 
-        if kv_cache is None or xa is None:
+        if kv_cache is None or xa is None or self.key not in kv_cache:
             # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
             # otherwise, perform key/value projections for self- or cross-attention as usual.
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
         else:
             # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = kv_cache.get(self.key, self.key(xa))
-            v = kv_cache.get(self.value, self.value(xa))
+            k = kv_cache[self.key]
+            v = kv_cache[self.value]
 
-        wv = self.qkv_attention(q, k, v, mask)
-        return self.out(wv)
+        wv, qk = self.qkv_attention(q, k, v, mask)
+        return self.out(wv), qk
 
-    def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
+    def qkv_attention(
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
+    ):
         n_batch, n_ctx, n_state = q.shape
         scale = (n_state // self.n_head) ** -0.25
         q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3) * scale
@@ -117,24 +102,28 @@ class MultiHeadAttention(nn.Module):
         qk = q @ k
         if mask is not None:
             qk = qk + mask[:n_ctx, :n_ctx]
+        qk = qk.float()
 
-        w = F.softmax(qk.float(), dim=-1).to(q.dtype)
-        return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+        w = F.softmax(qk, dim=-1).to(q.dtype)
+        return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False, dropout: float = 0.0):
+    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
         super().__init__()
-        self.dropout = dropout
 
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
 
-        self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attention else None
+        self.cross_attn = (
+            MultiHeadAttention(n_state, n_head) if cross_attention else None
+        )
         self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
 
         n_mlp = n_state * 4
-        self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
+        self.mlp = nn.Sequential(
+            Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
+        )
         self.mlp_ln = LayerNorm(n_state)
 
     def forward(
@@ -144,127 +133,94 @@ class ResidualAttentionBlock(nn.Module):
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
     ):
-        residual = x
-        x = self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = x + residual
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
         if self.cross_attn:
-            residual = x
-            x = self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)
-            x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-            x = x + residual
-        # the MLP needs to be changed from: fc1 -> act_fn -> fc2 to: fc1 -> act_fn -> dropout -> fc2 -> dropout
-        # since it's written as an nn.Sequential, adding the dropout would change the state_dict
-        # instead, we add dropout by overriding our pre-trained model in our training script (much faster!)
+            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, dropout: float):
+    def __init__(
+        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
         super().__init__()
-        self.dropout = 0.0
-
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head, dropout=self.dropout) for _ in range(n_layer)]
+            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         )
         self.ln_post = LayerNorm(n_state)
 
-    def forward(self, input_ids: Tensor, **kwargs):
+    def forward(self, x: Tensor):
         """
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
-        x = input_ids
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
 
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding).to(x.dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
 
         for block in self.blocks:
             x = block(x)
 
         x = self.ln_post(x)
-
-        encoder_output = EncoderOutput(last_hidden_state=x)
-        return encoder_output
+        return x
 
 
 class TextDecoder(nn.Module):
-    def __init__(self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, dropout: float):
+    def __init__(
+        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
         super().__init__()
-        self.dropout = dropout
 
         self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head, cross_attention=True, dropout=self.dropout) for _ in range(n_layer)]
+            [
+                ResidualAttentionBlock(n_state, n_head, cross_attention=True)
+                for _ in range(n_layer)
+            ]
         )
         self.ln = LayerNorm(n_state)
 
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
-        self.gradient_checkpointing = False
 
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
-        xa : torch.Tensor, shape = (batch_size, n_mels, n_audio_ctx)
+        xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
             the encoded audio features to be attended on
         """
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
-        x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
+        x = (
+            self.token_embedding(x)
+            + self.positional_embedding[offset : offset + x.shape[-1]]
+        )
         x = x.to(xa.dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
 
         for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, xa, self.mask)
-            else:
-                x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
         x = self.ln(x)
-        logits = (x @ self.token_embedding.weight.to(x.dtype).T).float()
+        logits = (
+            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
+        ).float()
 
         return logits
 
 
-def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id, pad_token_id):
-    """
-    Shift input ids one token to the right.
-    """
-    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
-    shifted_input_ids[:, 0] = decoder_start_token_id
-
-    if pad_token_id is None:
-        raise ValueError("self.model.config.pad_token_id has to be defined.")
-    # replace possible -100 values in labels by `pad_token_id`
-    shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
-
-    return shifted_input_ids
-
-
-class Whisper(nn.Module, GenerationMixin):
-    def __init__(self, dims: ModelDimensions, dropout_rate: Optional[float] = 0.0):
+class Whisper(nn.Module):
+    def __init__(self, dims: ModelDimensions):
         super().__init__()
-        self.config = T5Config()
-        self.config.decoder_start_token_id = 50257
-        self.config.bos_token_id = 50257
-
-        self.config.eos_token_id = 50256
-        self.config.pad_token_id = 50256
-
-        self.config.no_timestamp_token = 50362
         self.dims = dims
         self.encoder = AudioEncoder(
             self.dims.n_mels,
@@ -272,7 +228,6 @@ class Whisper(nn.Module, GenerationMixin):
             self.dims.n_audio_state,
             self.dims.n_audio_head,
             self.dims.n_audio_layer,
-            dropout_rate,
         )
         self.decoder = TextDecoder(
             self.dims.n_vocab,
@@ -280,101 +235,33 @@ class Whisper(nn.Module, GenerationMixin):
             self.dims.n_text_state,
             self.dims.n_text_head,
             self.dims.n_text_layer,
-            dropout_rate,
         )
-        self.kv_cache = None
-        self.encoder.main_input_name = "input_ids"
-        self.main_input_name = "input_ids"
+        # use the last half layers for alignment by default; see `set_alignment_heads()` below
+        all_heads = torch.zeros(
+            self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
+        )
+        all_heads[self.dims.n_text_layer // 2 :] = True
+        self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
 
-    def gradient_checkpointing_enable(self):
-        self.decoder.gradient_checkpointing = True
-
-    def get_encoder(self):
-        return self.encoder
-
-    def freeze_encoder(self):
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        self._requires_grad = False
+    def set_alignment_heads(self, dump: bytes):
+        array = np.frombuffer(
+            gzip.decompress(base64.b85decode(dump)), dtype=bool
+        ).copy()
+        mask = torch.from_numpy(array).reshape(
+            self.dims.n_text_layer, self.dims.n_text_head
+        )
+        self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
 
     def embed_audio(self, mel: torch.Tensor):
-        return self.encoder.forward(mel)
-
-    @classmethod
-    def load_trained(cls, path):
-        state_dict = torch.load(path)
-
-        # for now hard-code the model dimensions of
-        # `medium.en`
-        model_dims = ModelDimensions(
-            n_mels=80,
-            n_audio_ctx=1500,
-            n_audio_state=1024,
-            n_audio_head=16,
-            n_audio_layer=24,
-            n_text_layer=24,
-            n_vocab=51864,
-            n_text_ctx=448,
-            n_text_state=1024,
-            n_text_head=16,
-        )
-        model = cls(model_dims)
-        model.load_state_dict(state_dict)
-        model.eval()
-
-        return model
+        return self.encoder(mel)
 
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
-        return self.decoder.forward(tokens, audio_features)
+        return self.decoder(tokens, audio_features)
 
-#    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-#        decoder_logits = self.decoder(tokens, self.encoder(mel))
-#        return decoder_logits
-
-    def prepare_inputs_for_generation(self, input_ids: torch.LongTensor, encoder_outputs, **kwargs) -> Dict[str, Any]:
-        """
-        Implement in subclasses of [`PreTrainedModel`] for custom behavior to prepare inputs in the generate method.
-        """
-        if input_ids.shape[-1] == 1 and self.kv_cache is not None and self.hooks is not None:
-            self.clean_cache()
-
-        if input_ids.shape[-1] > 1:
-            input_ids = input_ids[:, -1:]
-
-        return {"input_ids": input_ids, "encoder_outputs": encoder_outputs}
-
-    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> Dict[str, torch.Tensor]:
-        if "encoder_outputs" in kwargs:
-            if self.kv_cache is None or len(self.kv_cache) == 0:
-                self.kv_cache, self.hooks = self.install_kv_cache_hooks()
-
-            encoder_hidden_states = kwargs["encoder_outputs"].last_hidden_state
-            tokens = input_ids
-
-            decoder_logits = self.decoder(tokens, encoder_hidden_states, kv_cache=self.kv_cache)
-            loss = None
-        else:
-            if self.kv_cache is not None and self.hooks is not None:
-                self.clean_cache()
-
-            mel = input_ids
-            tokens = shift_tokens_right(labels, decoder_start_token_id=self.config.decoder_start_token_id, pad_token_id=self.config.pad_token_id)
-            encoder_hidden_states = self.encoder(mel).last_hidden_state
-            decoder_logits = self.decoder(tokens, encoder_hidden_states)
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(decoder_logits.view(-1, decoder_logits.shape[-1]), labels.view(-1))
-
-        return WhisperOutput(loss=loss, logits=decoder_logits)
-
-    def clean_cache(self):
-        for hook in self.hooks:
-            hook.remove()
-
-        self.hooks = []
-        self.kv_cache = {}
-
-    def save_to(self, save_path=None):
-        torch.save(self.state_dict(), save_path)
+    def forward(
+        self, mel: torch.Tensor, tokens: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        return self.decoder(tokens, self.encoder(mel))
 
     @property
     def device(self):
@@ -402,8 +289,9 @@ class Whisper(nn.Module, GenerationMixin):
         hooks = []
 
         def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.decoder.positional_embedding.shape[0]:
-                cache[module] = output  # save as-is, for the first token or cross attention
+            if module not in cache or output.shape[1] > self.dims.n_text_ctx:
+                # save as-is, for the first token or cross attention
+                cache[module] = output
             else:
                 cache[module] = torch.cat([cache[module], output], dim=1).detach()
             return cache[module]
